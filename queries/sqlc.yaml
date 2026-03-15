@@ -1,0 +1,14 @@
+version: "2"
+sql:
+  - schema: "schema.sql"
+    queries: "query.sql"
+    engine: "postgresql"
+    gen:
+      go:
+        package: "db"
+        out: "db"
+        sql_package: "pgx/v5"
+        # Map the vector type to a float32 slice
+        overrides:
+          - db_type: "vector"
+            go_type: "github.com/pgvector/pgvector-go.Vector"
