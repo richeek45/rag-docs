@@ -28,11 +28,6 @@ import (
 	"github.com/richeek45/rag-docs/queries/db"
 )
 
-// curl http://localhost:11435/api/embeddings -d '{
-//   "model": "qwen3-embedding:4b",
-//   "prompt": "test"
-// }' | jq '.embedding | length'
-
 type Chunker struct {
 	MaxChunkChars int
 	OverlapCount  int
@@ -215,7 +210,6 @@ func (c *Chunker) flush(ctx context.Context, q *db.Queries, paperId int32, buffe
 	return nil
 }
 
-// psql -h localhost -U postgres -d papersdb
 func Config() *pgxpool.Config {
 	err := godotenv.Load()
 	if err != nil {
@@ -252,12 +246,12 @@ func Config() *pgxpool.Config {
 	dbConfig.ConnConfig.ConnectTimeout = defaultConnectTimeout
 
 	dbConfig.PrepareConn = func(ctx context.Context, c *pgx.Conn) (bool, error) {
-		log.Println("Before acquiring the connection pool to the database!!")
+		// log.Println("Before acquiring the connection pool to the database!!")
 		return true, nil
 	}
 
 	dbConfig.AfterRelease = func(c *pgx.Conn) bool {
-		log.Println("After releasing the connection pool to the database!!")
+		// log.Println("After releasing the connection pool to the database!!")
 		return true
 	}
 
@@ -265,20 +259,6 @@ func Config() *pgxpool.Config {
 		log.Println("Closed the connection pool to the database!!")
 	}
 	return dbConfig
-}
-
-func chunkText(text string, chunkSize int, overlap int) []string {
-	var chunks []string
-
-	for i := 0; i < len(text); i += (chunkSize - overlap) {
-		end := min(i+chunkSize, len(text))
-		chunks = append(chunks, text[i:end])
-		if end == len(text) {
-			break
-		}
-	}
-
-	return chunks
 }
 
 func main() {
@@ -302,86 +282,130 @@ func main() {
 	query := db.New(connPool)
 	defer connPool.Close()
 
-	filePath := "/Users/richeek/Documents/Resources/papers/dynamo-amazon-highly-available-key-value-store.pdf"
+	filePath := os.Getenv("FILE_PATH")
 	parts := strings.Split(filePath, "/")
 	title := parts[len(parts)-1]
-	// outputFile := "document.md"
-	err = ConvertMarkdownToPDF(filePath, title)
-	if err == nil {
-		err = DocumentVectorChunking(title, query)
-	}
-	if err != nil {
-		log.Fatal(err)
-		return
+	paperRow, _ := query.GetPaperByTitle(context.Background(), title)
+	fmt.Println(paperRow.Title != title)
+	if paperRow.Title != title {
+		err = ConvertMarkdownToPDF(filePath, title)
+		if err == nil {
+			err = DocumentVectorChunking(title, query)
+		}
+		if err != nil {
+			log.Fatal(err)
+			return
+		}
 	}
 
 	ollamaUrl := "http://localhost:11434"
 	embeddingsModel := "qwen3-embedding:8b"
 	chatModel := "qwen3:8b" //"llama3.2:latest"
 
-	userContent := `what is the name of the document?`
-	systemContent := `You are an AI assistant. You are expert in research in all of the computer science subjects`
+	systemContent := `### ROLE
+		You are an expert Research Assistant. Your goal is to provide accurate, concise, and context-aware answers based strictly on the provided document excerpts. You specialize in synthesizing information from diverse subjects, ranging from technical engineering to economics and law.
+
+		### TASK
+		1.  **Analyze the Context:** Review the provided snippets retrieved from the PDF database.
+		2.  **Synthesize Knowledge:** If a question spans multiple documents or subjects, connect the concepts logically.
+		3.  **Identify Constraints:** * If the answer is explicitly in the context, provide it with high detail.
+			* If the context is insufficient, state: "The provided documents do not contain enough information to answer this specifically," then offer a brief answer based on general knowledge *only* if requested.
+			* If the documents provide conflicting information, highlight the discrepancy (e.g., "Source A states X, while Source B suggests Y").
+
+		### RESPONSE GUIDELINES
+		* **Structure:** Use Markdown (bolding, bullet points, and headers) to make complex technical data readable.
+		* **Tone:** Professional, objective, and analytical.
+		* **Accuracy:** Do not hallucinate facts or dates not present in the text.
+		* **Citations:** When possible, refer to the specific PDF or section name provided in the context metadata.
+
+		### HANDLING TECHNICAL CONTENT
+		* **Equations:** Use LaTeX for mathematical formulas.
+		* **Code:** If the context contains code or logic, ensure indentation is preserved.
+		* **Terminology:** Maintain the specific jargon used in the source material (e.g., if a document uses "idempotency" or "liquidity preference," use those exact terms in the explanation).
+
+		---
+		### USER QUERY:
+		{user_query}
+
+		### RETRIEVED CONTEXT:
+		{context_chunks}`
 
 	options := llm.SetOptions(map[string]any{
 		option.Temperature: 0.0,
 	})
 
-	embeddingFromQuestion, err := embeddings.CreateEmbedding(
-		ollamaUrl,
-		llm.Query4Embedding{
-			Model:  embeddingsModel,
-			Prompt: userContent,
-		},
-		"question",
-	)
-	if err != nil {
-		log.Fatalln("😡:", err)
-	}
+	scanner := bufio.NewScanner(os.Stdin)
 
-	targetDim := 2000
-	var finalEmbedding []float32
-	if len(embeddingFromQuestion.Embedding) > targetDim {
-		truncated := embeddingFromQuestion.Embedding[:targetDim]
-
-		vec32 := make([]float32, len(truncated))
-		for i, vec := range truncated {
-			vec32[i] = float32(vec)
+	for {
+		fmt.Println("\n Ask a question or type exit?")
+		if !scanner.Scan() {
+			break
 		}
 
-		finalEmbedding = normalize(vec32)
-	}
+		userContent := scanner.Text()
+		if userContent == "exit" {
+			os.Exit(1)
+			break
+		}
 
-	similarityRows, _ := query.SearchSimilarChunks(
-		context.Background(),
-		db.SearchSimilarChunksParams{
-			Embedding: pgvector.NewVector(finalEmbedding),
-			Limit:     2,
-		})
+		embeddingFromQuestion, err := embeddings.CreateEmbedding(
+			ollamaUrl,
+			llm.Query4Embedding{
+				Model:  embeddingsModel,
+				Prompt: userContent,
+			},
+			"question",
+		)
+		if err != nil {
+			log.Fatalln(err)
+		}
 
-	var contextBuilder strings.Builder
-	for _, row := range similarityRows {
-		fmt.Fprintf(&contextBuilder, "\n--- Source: %s ---\n%s\n", row.PaperTitle, row.Content)
-	}
-	documentsContent := contextBuilder.String()
+		targetDim := 2000
+		var finalEmbedding []float32
+		if len(embeddingFromQuestion.Embedding) > targetDim {
+			truncated := embeddingFromQuestion.Embedding[:targetDim]
 
-	llmQuery := llm.Query{
-		Model: chatModel,
-		Messages: []llm.Message{
-			{Role: "system", Content: systemContent},
-			{Role: "system", Content: documentsContent},
-			{Role: "user", Content: userContent},
-		},
-		Options: options,
-	}
+			vec32 := make([]float32, len(truncated))
+			for i, vec := range truncated {
+				vec32[i] = float32(vec)
+			}
 
-	_, err = completion.ChatStream(ollamaUrl, llmQuery,
-		func(answer llm.Answer) error {
-			fmt.Print(answer.Message.Content)
-			return nil
-		})
+			finalEmbedding = normalize(vec32)
+		}
 
-	if err != nil {
-		log.Fatal(err)
+		similarityRows, _ := query.SearchSimilarChunks(
+			context.Background(),
+			db.SearchSimilarChunksParams{
+				Embedding: pgvector.NewVector(finalEmbedding),
+				Limit:     5,
+			})
+
+		var contextBuilder strings.Builder
+		for _, row := range similarityRows {
+			fmt.Fprintf(&contextBuilder, "\n--- Source: %s ---\n%s\n", row.PaperTitle, row.Content)
+		}
+		documentsContent := contextBuilder.String()
+
+		llmQuery := llm.Query{
+			Model: chatModel,
+			Messages: []llm.Message{
+				{Role: "system", Content: systemContent},
+				{Role: "system", Content: documentsContent},
+				{Role: "user", Content: userContent},
+			},
+			Options: options,
+		}
+
+		_, err = completion.ChatStream(ollamaUrl, llmQuery,
+			func(answer llm.Answer) error {
+				fmt.Print(answer.Message.Content)
+				return nil
+			})
+
+		if err != nil {
+			log.Fatal(err)
+		}
+
 	}
 
 }

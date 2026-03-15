@@ -12,6 +12,10 @@ RETURNING *;
 SELECT * FROM papers
 WHERE id = $1 LIMIT 1;
 
+-- name: GetPaperByTitle :one
+SELECT * FROM papers
+WHERE title = $1 LIMIT 1;
+
 -- name: ListChunksByPaper :many
 SELECT * FROM paper_chunks
 WHERE paper_id = $1

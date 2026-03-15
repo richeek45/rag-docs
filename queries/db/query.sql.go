@@ -78,6 +78,18 @@ func (q *Queries) GetPaperByID(ctx context.Context, id int32) (Paper, error) {
 	return i, err
 }
 
+const getPaperByTitle = `-- name: GetPaperByTitle :one
+SELECT id, title, created_at FROM papers
+WHERE title = $1 LIMIT 1
+`
+
+func (q *Queries) GetPaperByTitle(ctx context.Context, title string) (Paper, error) {
+	row := q.db.QueryRow(ctx, getPaperByTitle, title)
+	var i Paper
+	err := row.Scan(&i.ID, &i.Title, &i.CreatedAt)
+	return i, err
+}
+
 const listChunksByPaper = `-- name: ListChunksByPaper :many
 SELECT id, paper_id, content, chunk_index, embedding FROM paper_chunks
 WHERE paper_id = $1
@@ -133,7 +145,7 @@ type SearchSimilarChunksRow struct {
 	Content    string
 	PaperID    pgtype.Int4
 	PaperTitle string
-	Similarity float64
+	Similarity int32
 }
 
 // We use the <=> operator for cosine distance (smaller is better)
