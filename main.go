@@ -2,20 +2,20 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	_ "embed"
 	"fmt"
 	"io"
 	"log"
 	"math"
-	"net/http"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/blevesearch/segment"
-	// "github.com/clems4ever/all-minilm-l6-v2-go/all_minilm_l6_v2"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -53,6 +53,41 @@ func normalize(v []float32) []float32 {
 		res[i] = float32(float64(val) / magnitude)
 	}
 	return res
+}
+
+func ConvertMarkdownToPDF(filePath string, outputFile string) error {
+	cmd := exec.Command("pdftotext", "-layout", filePath, outputFile)
+
+	err := cmd.Run()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err != nil {
+		fmt.Printf("Error during conversion: %v\n", err)
+		fmt.Printf("Error: %s\n", stderr.String())
+		return err
+	}
+
+	fmt.Printf("Successfully converted %s to %s\n", filePath, outputFile)
+	return nil
+}
+
+func DocumentVectorChunking(title string, query *db.Queries) error {
+	file, err := os.Open(title)
+	if err != nil {
+		log.Fatal(err)
+		return err
+	}
+
+	defer file.Close()
+
+	chunker := Chunker{MaxChunkChars: 1200, OverlapCount: 2}
+	err = chunker.ProcessAndSave(context.Background(), query, title, file)
+	if err != nil {
+		log.Fatalln("😡:", err)
+		return err
+	}
+	return nil
 }
 
 func (c *Chunker) ProcessAndSave(ctx context.Context, q *db.Queries, title string, r io.Reader) error {
@@ -232,40 +267,6 @@ func Config() *pgxpool.Config {
 	return dbConfig
 }
 
-// func EmbeddingsComparison() {
-// 	// Embeddings comparison
-// 	model, err := all_minilm_l6_v2.NewModel(
-// 		all_minilm_l6_v2.WithRuntimePath("/usr/local/lib/libonnxruntime.dylib"),
-// 	)
-// 	if err != nil {
-// 		log.Fatalf("Failed to create model: %v", err)
-// 	}
-// 	defer model.Close()
-
-// 	// Base sentence to compare against
-// 	baseSentence := "The dog is running in the park"
-
-// 	// Three candidate sentences with varying degrees of similarity
-// 	candidates := []string{
-// 		"A dog runs through the park",      // Very similar
-// 		"The cat is sleeping on the couch", // Somewhat similar
-// 		"I love eating pizza for dinner",   // Not similar
-// 	}
-
-// 	// Compute embeddings
-// 	baseEmbedding, _ := model.Compute(baseSentence, false)
-// 	candidateEmbeddings, _ := model.ComputeBatch(candidates, false)
-
-// 	fmt.Printf("Base: %s\n\n", baseSentence)
-// 	fmt.Println("Similarity | Sentence")
-// 	fmt.Println("-----------|---------")
-
-// 	for i, candidate := range candidates {
-// 		similarity := all_minilm_l6_v2.CosineSimilarity(baseEmbedding, candidateEmbeddings[i])
-// 		fmt.Printf("   %.4f   | %s\n", similarity, candidate)
-// 	}
-// }
-
 func chunkText(text string, chunkSize int, overlap int) []string {
 	var chunks []string
 
@@ -301,95 +302,27 @@ func main() {
 	query := db.New(connPool)
 	defer connPool.Close()
 
-	// outputFile := "document.md"
 	filePath := "/Users/richeek/Documents/Resources/papers/dynamo-amazon-highly-available-key-value-store.pdf"
 	parts := strings.Split(filePath, "/")
 	title := parts[len(parts)-1]
-	fmt.Println(title)
-
-	// cmd := exec.Command("pdftotext", "-layout", filePath, outputFile)
-
-	// err = cmd.Run()
-	// var stderr bytes.Buffer
-	// cmd.Stderr = &stderr
-
-	// if err != nil {
-	// 	fmt.Printf("Error during conversion: %v\n", err)
-	// 	fmt.Printf("Error: %s\n", stderr.String())
-	// 	return
-	// }
-
-	// fmt.Printf("Successfully converted %s to %s\n", filePath, outputFile)
-
-	// file, err := os.Open(outputFile)
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-
-	// defer file.Close()
-
-	// chunker := Chunker{MaxChunkChars: 1200, OverlapCount: 2}
-	// err = chunker.ProcessAndSave(context.Background(), query, title, file)
-	// if err != nil {
-	// 	log.Fatalln("😡:", err)
-	// }
-
-	// we need to replace the docs with the pdf files
-	// docs := []string{
-	// `Michael Burnham is the main character on the Star Trek series, Discovery.
-	// She's a human raised on the logical planet Vulcan by Spock's father.
-	// Burnham is intelligent and struggles to balance her human emotions with Vulcan logic.
-	// She's become a Starfleet captain known for her determination and problem-solving skills.
-	// Originally played by actress Sonequa Martin-Green`,
-
-	// 	`James T. Kirk, also known as Captain Kirk, is a fictional character from the Star Trek franchise.
-	// He's the iconic captain of the starship USS Enterprise,
-	// boldly exploring the galaxy with his crew.
-	// Originally played by actor William Shatner,
-	// Kirk has appeared in TV series, movies, and other media.`,
-
-	// 	`Jean-Luc Picard is a fictional character in the Star Trek franchise.
-	// He's most famous for being the captain of the USS Enterprise-D,
-	// a starship exploring the galaxy in the 24th century.
-	// Picard is known for his diplomacy, intelligence, and strong moral compass.
-	// He's been portrayed by actor Patrick Stewart.`,
-
-	// 	`Lieutenant Richeek, known as the **Silent Sentinel** of the USS Discovery,
-	// is the enigmatic programming genius whose codes safeguard the ship's secrets and operations.
-	// His swift problem-solving skills are as legendary as the mysterious aura that surrounds him.
-	// Charrière, a man of few words, speaks the language of machines with unrivaled fluency,
-	// making him the crew's unsung guardian in the cosmos. His best friend is Spiderman from the Marvel Cinematic Universe.`,
-	// }
-
-	// store := embeddings.MemoryVectorStore{
-	// 	Records: make(map[string]llm.VectorRecord),
-	// }
-
-	// for idx, doc := range docs {
-	// 	fmt.Println("Creating embedding from document ", idx)
-	// 	embedding, err := embeddings.CreateEmbedding(
-	// 		ollamaUrl,
-	// 		llm.Query4Embedding{
-	// 			Model:  embeddingsModel,
-	// 			Prompt: doc,
-	// 		},
-	// 		strconv.Itoa(idx),
-	// 	)
-	// 	if err != nil {
-	// 		fmt.Println("😡:", err)
-	// 	} else {
-	// 		store.Save(embedding)
-	// 	}
-	// }
+	// outputFile := "document.md"
+	err = ConvertMarkdownToPDF(filePath, title)
+	if err == nil {
+		err = DocumentVectorChunking(title, query)
+	}
+	if err != nil {
+		log.Fatal(err)
+		return
+	}
 
 	ollamaUrl := "http://localhost:11434"
-	embeddingsModel := "qwen3-embedding:8b" // This model is for the embeddings of the documents
-	chatModel := "qwen3:8b"                 //"llama3.2:latest"
+	embeddingsModel := "qwen3-embedding:8b"
+	chatModel := "qwen3:8b" //"llama3.2:latest"
 
 	userContent := `what is the name of the document?`
 	systemContent := `You are an AI assistant. You are expert in research in all of the computer science subjects`
 
-	options := llm.SetOptions(map[string]interface{}{
+	options := llm.SetOptions(map[string]any{
 		option.Temperature: 0.0,
 	})
 
@@ -418,7 +351,6 @@ func main() {
 		finalEmbedding = normalize(vec32)
 	}
 
-	// similarity, _ := store.SearchMaxSimilarity(embeddingFromQuestion) // have to do it with postgres
 	similarityRows, _ := query.SearchSimilarChunks(
 		context.Background(),
 		db.SearchSimilarChunksParams{
@@ -428,13 +360,9 @@ func main() {
 
 	var contextBuilder strings.Builder
 	for _, row := range similarityRows {
-		contextBuilder.WriteString(fmt.Sprintf("\n--- Source: %s ---\n%s\n", row.PaperTitle, row.Content))
+		fmt.Fprintf(&contextBuilder, "\n--- Source: %s ---\n%s\n", row.PaperTitle, row.Content)
 	}
 	documentsContent := contextBuilder.String()
-
-	fmt.Println("documentsContent", documentsContent)
-
-	// documentsContent := `<context><doc>` + strings.Join(similarity, " ") + `</doc></context>`
 
 	llmQuery := llm.Query{
 		Model: chatModel,
@@ -455,8 +383,5 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	fmt.Println("🚀 Server started on :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
 
 }
