@@ -1,12 +1,18 @@
 -- name: CreatePaper :one
 INSERT INTO papers (title)
 VALUES ($1)
+ON CONFLICT (title) 
+DO UPDATE SET title = EXCLUDED.title
 RETURNING id, title, created_at;
 
 -- name: CreatePaperChunk :one
 INSERT INTO paper_chunks (paper_id, content, chunk_index, embedding)
 VALUES ($1, $2, $3, $4)
 RETURNING *;
+
+-- name: DeletePaperChunkByPaperID :exec
+DELETE FROM paper_chunks
+WHERE paper_id = $1;
 
 -- name: GetPaperByID :one
 SELECT * FROM papers

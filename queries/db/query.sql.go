@@ -15,6 +15,8 @@ import (
 const createPaper = `-- name: CreatePaper :one
 INSERT INTO papers (title)
 VALUES ($1)
+ON CONFLICT (title) 
+DO UPDATE SET title = EXCLUDED.title
 RETURNING id, title, created_at
 `
 
@@ -63,6 +65,16 @@ WHERE id = $1
 
 func (q *Queries) DeletePaper(ctx context.Context, id int32) error {
 	_, err := q.db.Exec(ctx, deletePaper, id)
+	return err
+}
+
+const deletePaperChunkByPaperID = `-- name: DeletePaperChunkByPaperID :exec
+DELETE FROM paper_chunks
+WHERE paper_id = $1
+`
+
+func (q *Queries) DeletePaperChunkByPaperID(ctx context.Context, paperID pgtype.Int4) error {
+	_, err := q.db.Exec(ctx, deletePaperChunkByPaperID, paperID)
 	return err
 }
 

@@ -11,8 +11,10 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/blevesearch/segment"
@@ -24,7 +26,8 @@ import (
 	"github.com/parakeet-nest/parakeet/embeddings"
 	"github.com/parakeet-nest/parakeet/enums/option"
 	"github.com/parakeet-nest/parakeet/llm"
-	"github.com/pgvector/pgvector-go"
+	pgvector "github.com/pgvector/pgvector-go"
+	pgvectorPgx "github.com/pgvector/pgvector-go/pgx"
 	"github.com/richeek45/rag-docs/queries/db"
 )
 
@@ -32,6 +35,13 @@ type Chunker struct {
 	MaxChunkChars int
 	OverlapCount  int
 }
+
+type Job struct {
+	Path  string
+	Title string
+}
+
+const BATCH_SIZE = 30
 
 func normalize(v []float32) []float32 {
 	var sum float64
@@ -51,6 +61,7 @@ func normalize(v []float32) []float32 {
 }
 
 func ConvertMarkdownToPDF(filePath string, outputFile string) error {
+	// DO NOT CONVERT IF ALREADY CONVERTED
 	cmd := exec.Command("pdftotext", "-layout", filePath, outputFile)
 
 	err := cmd.Run()
@@ -67,7 +78,7 @@ func ConvertMarkdownToPDF(filePath string, outputFile string) error {
 	return nil
 }
 
-func DocumentVectorChunking(title string, query *db.Queries) error {
+func DocumentVectorChunking(title string, query *db.Queries, db *pgxpool.Pool, paperId int32) error {
 	file, err := os.Open(title)
 	if err != nil {
 		log.Fatal(err)
@@ -76,30 +87,64 @@ func DocumentVectorChunking(title string, query *db.Queries) error {
 
 	defer file.Close()
 
-	chunker := Chunker{MaxChunkChars: 1200, OverlapCount: 2}
-	err = chunker.ProcessAndSave(context.Background(), query, title, file)
+	err = query.DeletePaperChunkByPaperID(context.Background(), pgtype.Int4{Int32: paperId, Valid: true})
 	if err != nil {
-		log.Fatalln("😡:", err)
+		log.Fatalln(err)
+		return err
+	}
+
+	chunker := Chunker{MaxChunkChars: 1200, OverlapCount: 2}
+	err = chunker.ProcessAndCreateEmbeddings(context.Background(), query, db, paperId, title, file)
+	if err != nil {
+		log.Fatalln(err)
 		return err
 	}
 	return nil
 }
 
-func (c *Chunker) ProcessAndSave(ctx context.Context, q *db.Queries, title string, r io.Reader) error {
-	// paper, err := q.CreatePaper(ctx, title)
-	// if err != nil {
-	// 	return err
-	// }
-	paper, err := q.GetPaperByID(ctx, 1)
+func BulkInsertChunks(ctx context.Context, db *pgxpool.Pool, chunks []db.CreatePaperChunkParams) error {
+	columns := []string{"paper_id", "content", "chunk_index", "embedding"}
+
+	count, err := db.CopyFrom(
+		ctx,
+		pgx.Identifier{"paper_chunks"},
+		columns,
+		pgx.CopyFromSlice(len(chunks), func(i int) ([]any, error) {
+			return []any{
+				chunks[i].PaperID,
+				chunks[i].Content,
+				chunks[i].ChunkIndex,
+				chunks[i].Embedding,
+			}, nil
+		}),
+	)
 	if err != nil {
-		return err
+		return fmt.Errorf("CopyFrom failed: %v", err)
 	}
 
+	log.Printf("Successfully bulk inserted %d chunks", count)
+	return nil
+}
+
+func (c *Chunker) ProcessAndCreateEmbeddings(ctx context.Context, q *db.Queries, pool *pgxpool.Pool, paperId int32, title string, r io.Reader) error {
 	scanner := bufio.NewScanner(r)
 	var currentBuffer []string
 	var currentLen int
 	chunkIndex := 0
 	currentHeader := ""
+	chunks := make([]db.CreatePaperChunkParams, 0, BATCH_SIZE)
+
+	flush := func() error {
+		if len(chunks) == 0 {
+			return nil
+		}
+		err := BulkInsertChunks(ctx, pool, chunks)
+		if err != nil {
+			return err
+		}
+		chunks = chunks[:0]
+		return nil
+	}
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -107,13 +152,22 @@ func (c *Chunker) ProcessAndSave(ctx context.Context, q *db.Queries, title strin
 			continue
 		}
 
-		if strings.HasPrefix(line, "#") {
+		if strings.HasPrefix(line, "#") || (currentLen > c.MaxChunkChars) {
 			if len(currentBuffer) > 0 {
-				if err := c.flush(ctx, q, paper.ID, &currentBuffer, &currentLen, &chunkIndex, currentHeader); err != nil {
+				embeddingChunk, err := c.CreateEmbeddingsChunks(ctx, q, paperId, &currentBuffer, &currentLen, &chunkIndex, currentHeader)
+				if err != nil {
 					return err
 				}
+				chunks = append(chunks, *embeddingChunk)
+				if len(chunks) > BATCH_SIZE {
+					if err := flush(); err != nil {
+						return err
+					}
+				}
 			}
-			currentHeader = line
+			if strings.HasPrefix(line, "#") {
+				currentHeader = line
+			}
 			continue
 		}
 
@@ -126,24 +180,22 @@ func (c *Chunker) ProcessAndSave(ctx context.Context, q *db.Queries, title strin
 			sentence := strings.TrimSpace(seg.Text())
 			currentBuffer = append(currentBuffer, sentence)
 			currentLen += len(sentence)
-
-		}
-
-		if currentLen > c.MaxChunkChars {
-			if err := c.flush(ctx, q, paper.ID, &currentBuffer, &currentLen, &chunkIndex, currentHeader); err != nil {
-				return err
-			}
 		}
 	}
 
 	if len(currentBuffer) > 0 {
-		return c.flush(ctx, q, paper.ID, &currentBuffer, &currentLen, &chunkIndex, currentHeader)
+		embeddingChunk, err := c.CreateEmbeddingsChunks(ctx, q, paperId, &currentBuffer, &currentLen, &chunkIndex, currentHeader)
+		if err != nil {
+			return err
+		}
+		chunks = append(chunks, *embeddingChunk)
 	}
 
-	return scanner.Err()
+	return flush()
 }
 
-func (c *Chunker) flush(ctx context.Context, q *db.Queries, paperId int32, buffer *[]string, currentLen *int, index *int, header string) error {
+func (c *Chunker) CreateEmbeddingsChunks(ctx context.Context, q *db.Queries, paperId int32, buffer *[]string, currentLen *int, index *int, header string) (
+	*db.CreatePaperChunkParams, error) {
 	ollamaUrl := "http://localhost:11434"
 	embeddingsModel := "qwen3-embedding:8b" // This model is for the embeddings of the documents
 
@@ -162,7 +214,8 @@ func (c *Chunker) flush(ctx context.Context, q *db.Queries, paperId int32, buffe
 		strconv.Itoa(*index),
 	)
 	if err != nil {
-		fmt.Println("😡:", err)
+		fmt.Println(err)
+		return nil, err
 	}
 
 	targetDim := 2000
@@ -174,24 +227,7 @@ func (c *Chunker) flush(ctx context.Context, q *db.Queries, paperId int32, buffe
 		for i, vec := range truncated {
 			vec32[i] = float32(vec)
 		}
-
-		// 2. Re-normalize to maintain search accuracy
 		finalEmbedding = normalize(vec32)
-
-		// 3. Save finalEmbedding to DB
-		// Ensure your SQL table matches: embedding vector(1536)
-	}
-
-	fmt.Println("Creating chunk")
-	_, err = q.CreatePaperChunk(ctx, db.CreatePaperChunkParams{
-		Content:    chunkText,
-		ChunkIndex: pgtype.Int4{Int32: int32(*index), Valid: true},
-		Embedding:  pgvector.NewVector(finalEmbedding),
-		PaperID:    pgtype.Int4{Int32: paperId, Valid: true},
-	})
-	if err != nil {
-		log.Println(err)
-		return err
 	}
 
 	overlapStart := len(*buffer) - c.OverlapCount
@@ -207,7 +243,40 @@ func (c *Chunker) flush(ctx context.Context, q *db.Queries, paperId int32, buffe
 		*currentLen += len(s)
 	}
 	*index++
-	return nil
+
+	return &db.CreatePaperChunkParams{
+		Content:    chunkText,
+		ChunkIndex: pgtype.Int4{Int32: int32(*index), Valid: true},
+		Embedding:  pgvector.NewVector(finalEmbedding),
+		PaperID:    pgtype.Int4{Int32: paperId, Valid: true},
+	}, nil
+}
+
+func worker(id int, jobs <-chan Job, q *db.Queries, pool *pgxpool.Pool, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for job := range jobs {
+		fmt.Printf("Worker %d: Processing %s\n", id, job.Title)
+
+		paper, err := q.CreatePaper(context.Background(), job.Title)
+		title := strings.ReplaceAll(paper.Title, ".pdf", ".md")
+
+		if err != nil {
+			fmt.Printf("Worker %d: Skip %s (already exists or error: %v)\n", id, job.Title, err)
+			continue
+		}
+
+		err = ConvertMarkdownToPDF(job.Path, title)
+		if err != nil {
+			fmt.Printf("Worker %d: Failed to convert file %s to markdown: %v)\n", id, job.Title, err)
+			return
+		}
+
+		err = DocumentVectorChunking(job.Title, q, pool, paper.ID)
+		if err != nil {
+			fmt.Printf("Worker %d: Failed to convert file %s to markdown: %v)\n", id, job.Title, err)
+			return
+		}
+	}
 }
 
 func Config() *pgxpool.Config {
@@ -228,8 +297,6 @@ func Config() *pgxpool.Config {
 	dbPassword := os.Getenv("DB_PASSWORD")
 	dbPort := os.Getenv("DB_PORT")
 	sslMode := os.Getenv("SSL_MODE")
-
-	fmt.Println(dbHost, dbName, dbUser, dbPassword, dbPort, sslMode)
 
 	dsn := fmt.Sprintf("host=%s user=%s password=%s dbname=%s port=%s sslmode=%s", dbHost, dbUser, dbPassword, dbName, dbPort, sslMode)
 
@@ -253,6 +320,10 @@ func Config() *pgxpool.Config {
 	dbConfig.AfterRelease = func(c *pgx.Conn) bool {
 		// log.Println("After releasing the connection pool to the database!!")
 		return true
+	}
+
+	dbConfig.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		return pgvectorPgx.RegisterTypes(ctx, conn)
 	}
 
 	dbConfig.BeforeClose = func(c *pgx.Conn) {
@@ -282,21 +353,32 @@ func main() {
 	query := db.New(connPool)
 	defer connPool.Close()
 
-	filePath := os.Getenv("FILE_PATH")
-	parts := strings.Split(filePath, "/")
-	title := parts[len(parts)-1]
-	paperRow, _ := query.GetPaperByTitle(context.Background(), title)
-	fmt.Println(paperRow.Title != title)
-	if paperRow.Title != title {
-		err = ConvertMarkdownToPDF(filePath, title)
-		if err == nil {
-			err = DocumentVectorChunking(title, query)
-		}
-		if err != nil {
-			log.Fatal(err)
-			return
+	jobQueue := make(chan Job, 100)
+	var wg sync.WaitGroup
+	numWorkers := 3
+	for i := 1; i <= numWorkers; i++ {
+		wg.Add(1)
+		go worker(i, jobQueue, query, connPool, &wg)
+	}
+
+	folderPath := os.Getenv("FOLDER_PATH")
+	files, err := os.ReadDir(folderPath)
+
+	for _, f := range files {
+		if !f.IsDir() && strings.HasSuffix(f.Name(), ".pdf") {
+			fullPath := filepath.Join(folderPath, f.Name())
+
+			paper, _ := query.GetPaperByTitle(context.Background(), f.Name())
+
+			if paper.Title != f.Name() {
+				jobQueue <- Job{Path: fullPath, Title: f.Name()}
+			}
 		}
 	}
+
+	close(jobQueue)
+	wg.Wait()
+	fmt.Println("🎉 All PDFs processed successfully!")
 
 	ollamaUrl := "http://localhost:11434"
 	embeddingsModel := "qwen3-embedding:8b"
@@ -337,7 +419,7 @@ func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 
 	for {
-		fmt.Println("\n Ask a question or type exit?")
+		fmt.Println("\n\n\n Ask a question or type exit?\n")
 		if !scanner.Scan() {
 			break
 		}
